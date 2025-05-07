@@ -1,10 +1,10 @@
 // authActions.js
-import axios from 'axios';
+import axiosInstance from '../axiosInstance';
 
 export const loginUser = (userData) => async (dispatch) => {
   try {
-    // const response = await axios.post('https://google-drive-clone-server.vercel.app/api/auth/login', userData);
-    const response = await axios.post('https://ai-video-generator-server.vercel.app/api/auth/login', userData);
+    // Using the axios instance for consistent API calls
+    const response = await axiosInstance.post('/auth/login', userData);
     const { token } = response.data;
 
     sessionStorage.setItem('token', token);
@@ -18,6 +18,5 @@ export const loginUser = (userData) => async (dispatch) => {
 };
 
 export const logoutUser = () => () => {
-    sessionStorage.removeItem('token');
-  };
-  
+  sessionStorage.removeItem('token');
+};

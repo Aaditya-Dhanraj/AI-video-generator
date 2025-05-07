@@ -21,7 +21,7 @@ const VideoGallery = () => {
   const fetchVideos = async () => {
     setLoading(true);
     try {
-      const response = await axiosInstance.get('https://ai-video-generator-server.vercel.app/api/update');
+      const response = await axiosInstance.get('/update');
       if (response.data.success) {
         // Parse the videoArr string to an actual array
         const parsedVideos = JSON.parse(response.data.videoArr);
@@ -52,7 +52,7 @@ const VideoGallery = () => {
     setError(null);
     
     try {
-      const response = await axiosInstance.post('https://ai-video-generator-server.vercel.app/api/videos', {
+      const response = await axiosInstance.post('/videos', {
         celebName: celebrityName,
         sports: expertise,
       });
@@ -76,7 +76,9 @@ const VideoGallery = () => {
         setCreateSuccess(true);
         
         // Clear success message after delay
-        setTimeout(() => setCreateSuccess(false), 3000);
+        setTimeout(() => {setCreateSuccess(false)
+          setActiveTab('gallery')
+        }, 800);
       } else {
         setError(response.data.message || 'Failed to create video');
       }
@@ -96,7 +98,7 @@ const VideoGallery = () => {
 
     setIsDeleting(true);
     try {
-      const response = await axiosInstance.post(`https://ai-video-generator-server.vercel.app/api/update?videoId=${videoId}`);
+      const response = await axiosInstance.post(`/update?videoId=${videoId}`);
       
       if (response.data.success) {
         // Remove the deleted video from state
@@ -291,7 +293,7 @@ const VideoGallery = () => {
                             <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                           </svg>
                         </span>
-                        Processing Video...
+                        Video will be ready in 10 secs...
                       </>
                     ) : (
                       'Create Video'
