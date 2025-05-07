@@ -7,6 +7,7 @@ const fileRoutes = require('./routes/fileRoutes');
 const fileTreeRoutes = require('./routes/fileTreeRoutes');
 const videoRoutes = require('./routes/videoRoutes');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 
 dotenv.config();
 const app = express();
@@ -17,9 +18,20 @@ const server = require('http').createServer(app);
 // Set timeout to 5 minutes (300000 ms)
 server.timeout = 300000;
 
+const corsOptions = {
+    origin: '*', // Allow all origins - for development only! For production, specify your frontend URL
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    credentials: true, // Allow cookies to be sent with requests
+    preflightContinue: false,
+    optionsSuccessStatus: 204
+  };
+
 app.use(bodyParser.json());
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json());
+
+app.options('*', cors(corsOptions));
 
 // API Routes
 app.use('/api/auth', authRoutes);
