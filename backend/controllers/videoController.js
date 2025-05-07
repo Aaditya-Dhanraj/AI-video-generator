@@ -19,6 +19,53 @@ const sharp = require('sharp');
 ffmpeg.setFfmpegPath(ffmpegPath);
 dotenv.config();
 
+// Create a central logger
+const logger = {
+  info: (message, meta = {}) => {
+    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, meta);
+  },
+  error: (message, error = null, meta = {}) => {
+    console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, error ? { error: error.stack || error.message || error, ...meta } : meta);
+  },
+  warn: (message, meta = {}) => {
+    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, meta);
+  },
+  debug: (message, meta = {}) => {
+    if (process.env.DEBUG) {
+      console.debug(`[DEBUG] ${new Date().toISOString()} - ${message}`, meta);
+    }
+  }
+};
+
+// Ensure tmp directory exists (for Vercel serverless functions)
+const ensureTmpDirectoryExists = () => {
+  try {
+    if (!fs.existsSync('/tmp')) {
+      fs.mkdirSync('/tmp', { recursive: true });
+      logger.info('Created /tmp directory');
+    }
+  } catch (error) {
+    logger.error('Error ensuring /tmp directory exists', error);
+    // If we can't create /tmp, we're in a serious environment issue
+    throw new Error('Cannot create /tmp directory for file operations');
+  }
+};
+
+// Helper to create a folder in /tmp
+const createTmpFolder = (folderName) => {
+  const fullPath = path.join('/tmp', folderName);
+  try {
+    if (!fs.existsSync(fullPath)) {
+      fs.mkdirSync(fullPath, { recursive: true });
+      logger.debug(`Created folder ${fullPath}`);
+    }
+    return fullPath;
+  } catch (error) {
+    logger.error(`Error creating folder ${fullPath}`, error);
+    throw error;
+  }
+};
+
 const isValidObjectId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 const geminiAi = new GoogleGenAI({ apiKey: process.env.GOOGLE_STUDIO_GEMINI_API_KEY });
@@ -31,7 +78,7 @@ const captionGenerationClient = new AssemblyAI({
     apiKey: process.env.ASSEMBLY_AI_CAPTION_GENERATOR_API_KEY,
   });
 
-  const openAiNebiusClient = new OpenAI({
+const openAiNebiusClient = new OpenAI({
     baseURL: 'https://api.studio.nebius.com/v1/',
     apiKey: process.env.NEBIUS_API_KEY_FOR_IMAGE_GENERATION,
 });
@@ -77,82 +124,126 @@ Each image prompt should be detailed enough to generate a photorealistic image o
 }
 
 async function getImageAndContentPrompt(celebName, sports) {
-  const response = await geminiAi.models.generateContent({
-    model: "gemini-1.5-flash",
-    contents: imageAndContentPrompt(celebName, sports),
-    config: {
-        temperature: 1,
-        topP: 0.95,
-        topK: 40,
-        maxOutputTokens: 8192,
-        responseMimeType: "application/json"
-      },
-  });
-
-  const script = JSON.parse(response?.candidates[0]?.content?.parts[0]?.text)?.scenes || null;
-  return script;
+  try {
+    logger.info(`Generating content prompt for ${celebName} in ${sports}`);
+    
+    const response = await geminiAi.models.generateContent({
+      model: "gemini-1.5-flash",
+      contents: imageAndContentPrompt(celebName, sports),
+      config: {
+          temperature: 1,
+          topP: 0.95,
+          topK: 40,
+          maxOutputTokens: 8192,
+          responseMimeType: "application/json"
+        },
+    });
+    
+    if (!response?.candidates?.[0]?.content?.parts?.[0]?.text) {
+      logger.error('Empty or invalid response from Gemini API', null, { 
+        celebName, 
+        sports,
+        responseStructure: response ? JSON.stringify(Object.keys(response), null, 2) : 'null' 
+      });
+      return null;
+    }
+    
+    try {
+      const script = JSON.parse(response.candidates[0].content.parts[0].text)?.scenes || null;
+      
+      if (!script) {
+        logger.error('Failed to parse JSON from Gemini response', null, { 
+          responseText: response.candidates[0].content.parts[0].text.substring(0, 1000) + '...' 
+        });
+        return null;
+      }
+      
+      logger.info(`Successfully generated script with ${script.length} scenes`);
+      return script;
+    } catch (parseError) {
+      logger.error('JSON parsing error in Gemini response', parseError, { 
+        responseText: response.candidates[0].content.parts[0].text.substring(0, 1000) + '...' 
+      });
+      return null;
+    }
+  } catch (error) {
+    logger.error('Error in getImageAndContentPrompt', error, { celebName, sports });
+    return null;
+  }
 }
 
 async function convertTextToSpeech(contentText, fileId, key) {
     const text = contentText || null;
 
     if(!text) {
+        logger.warn(`Empty text content for speech conversion`, { fileId, key });
         return null;
     }
 
+    // Create folder in /tmp
     const folderName = `assets_${fileId}`;
+    const tmpFolderPath = createTmpFolder(folderName);
+    logger.debug(`Converting text to speech`, { fileId, key, textLength: text.length });
 
     try {
-        if (!fs.existsSync(folderName)) {
-            fs.mkdirSync(folderName);
-        }
-  
-    const request = {
-      input: {text: text},
-      voice: {languageCode: 'en-US', ssmlGender: 'FEMALE'},
-      audioConfig: {audioEncoding: 'MP3'},
-    };
-  
-    const [response] = await textToSpeechClient.synthesizeSpeech(request);
+        const request = {
+          input: {text: text},
+          voice: {languageCode: 'en-US', ssmlGender: 'FEMALE'},
+          audioConfig: {audioEncoding: 'MP3'},
+        };
+      
+        const [response] = await textToSpeechClient.synthesizeSpeech(request);
 
-    const filePath = `${folderName}/${fileId}_${key}.mp3`;
+        const filePath = path.join(tmpFolderPath, `${fileId}_${key}.mp3`);
+        logger.debug(`Speech synthesis complete, writing to ${filePath}`);
 
-
-    const writeFile = util.promisify(fs.writeFile);
-    await writeFile(filePath, response.audioContent, 'binary');
-    return true;
-} catch (error) {
-    return null;
+        const writeFile = util.promisify(fs.writeFile);
+        await writeFile(filePath, response.audioContent, 'binary');
+        logger.info(`Successfully created speech file`, { filePath });
+        return true;
+    } catch (error) {
+        logger.error('Error in convertTextToSpeech', error, { fileId, key, text: text.substring(0, 100) });
+        return null;
+    }
 }
-  }
 
-  async function convertSpeechToCaption(fileId, i) {
+async function convertSpeechToCaption(fileId, i) {
+    // Use /tmp for all file operations
     const folderName = `assets_${fileId}`;
-    const audioFilePath = `${folderName}/${fileId}_${i}.mp3`;
-    const jsonFilePath = `${folderName}/${fileId}_${i}.json`;
+    const tmpFolderPath = path.join('/tmp', folderName);
+    const audioFilePath = path.join(tmpFolderPath, `${fileId}_${i}.mp3`);
+    const jsonFilePath = path.join(tmpFolderPath, `${fileId}_${i}.json`);
+    
+    logger.debug(`Starting speech to caption conversion`, { fileId, index: i });
     
     try {
-        if (!fs.existsSync(folderName)) {
-            console.log(`Folder ${folderName} does not exist`);
+        if (!fs.existsSync(tmpFolderPath)) {
+            logger.error(`Folder not found for caption generation`, null, { tmpFolderPath });
             return null;
         }
         
         if (!fs.existsSync(audioFilePath)) {
-            console.log(`Audio file ${audioFilePath} does not exist`);
+            logger.error(`Audio file not found for caption generation`, null, { audioFilePath });
             return null;
         }
+        
+        logger.debug(`Audio file exists, proceeding with transcription`, { audioFilePath });
         
         const params = {
             audio: audioFilePath,
         };
         
         try {
-            console.log("Starting transcription...");
+            logger.info(`Starting transcription with AssemblyAI`, { fileId, index: i });
             const transcript = await captionGenerationClient.transcripts.transcribe(params);
-            console.log("Transcription complete");
+            logger.info(`Transcription complete`, { fileId, index: i });
             
             if (!transcript || !transcript.words) {
-                console.log("No transcript or words in response");
+                logger.error(`No transcript or words in AssemblyAI response`, null, { 
+                  fileId, 
+                  index: i,
+                  transcriptStructure: transcript ? JSON.stringify(Object.keys(transcript), null, 2) : 'null' 
+                });
                 return null;
             }
             
@@ -160,28 +251,32 @@ async function convertTextToSpeech(contentText, fileId, key) {
                 const jsonContent = JSON.stringify(transcript.words, null, 2);
                 
                 await fs.promises.writeFile(jsonFilePath, jsonContent, 'utf8');
-                console.log(`Caption file written to ${jsonFilePath}`);
+                logger.info(`Caption file written successfully`, { jsonFilePath });
                 return true;
             } catch (writeError) {
+                logger.error(`Failed to write caption file`, writeError, { jsonFilePath });
                 return null;
             }
         } catch (transcriptionError) {
+            logger.error(`Transcription failed with AssemblyAI`, transcriptionError, { fileId, index: i });
             return null;
         }
     } catch (error) {
-        console.error("Overall function error:", error);
+        logger.error(`Overall error in convertSpeechToCaption`, error, { fileId, index: i });
         return null;
     }
 }
 
 async function generateImages(prompt, fileId, idx) {
+    // Use /tmp for all file operations
     const folderName = `assets_${fileId}`;
-    const imagePath = `${folderName}/${fileId}_${idx}.png`;
+    const tmpFolderPath = createTmpFolder(folderName);
+    const imagePath = path.join(tmpFolderPath, `${fileId}_${idx}.png`);
+    
+    logger.debug(`Starting image generation`, { fileId, index: idx, promptLength: prompt.length });
     
     try {
-        if (!fs.existsSync(folderName)) {
-            return null;
-        }
+        logger.info(`Calling Nebius API for image generation`, { fileId, index: idx });
         
         const response = await openAiNebiusClient.images.generate({
             "model": "black-forest-labs/flux-schnell",
@@ -198,164 +293,241 @@ async function generateImages(prompt, fileId, idx) {
         });
         
         if (!response || !response.data || !response.data[0] || !response.data[0].b64_json) {
+            logger.error(`Invalid or empty response from Nebius API`, null, { 
+              fileId, 
+              index: idx,
+              responseStructure: response ? JSON.stringify(Object.keys(response), null, 2) : 'null' 
+            });
             return null;
         }
         
         const imageData = response.data[0].b64_json;
+        logger.debug(`Image data received, base64 length: ${imageData.length}`);
         
         const buffer = Buffer.from(imageData, 'base64');
         
         const writeFile = util.promisify(fs.writeFile);
         await writeFile(imagePath, buffer);
         
+        logger.info(`Successfully created image file`, { imagePath });
         return true;
     } catch (error) {
+        logger.error(`Error in generateImages`, error, { fileId, index: idx });
         return null;
     }
 }
 
 async function deleteFolder(fileId) {
+    // Use /tmp for all file operations
     const folderName = `assets_${fileId}`;
+    const tmpFolderPath = path.join('/tmp', folderName);
+    logger.debug(`Attempting to delete folder`, { tmpFolderPath });
+    
     try {
-        if (fs.existsSync(folderName)) {
-            fs.rmSync(folderName, { recursive: true, force: true });            
+        if (fs.existsSync(tmpFolderPath)) {
+            fs.rmSync(tmpFolderPath, { recursive: true, force: true });
+            logger.info(`Successfully deleted folder`, { tmpFolderPath });            
+        } else {
+            logger.debug(`Folder not found for deletion`, { tmpFolderPath });
         }
     } catch (deleteError) {
-        console.error('Error while deleting folder:', deleteError);
+        logger.error(`Error while deleting folder`, deleteError, { tmpFolderPath });
     }
 }
 
 async function buildVideo(userid) {
-    const dir = `assets_${userid}`;
-    if (!fs.existsSync(dir+'/1.png')) {
-      fs.renameSync(dir+`/${userid}_0.png`, dir+'/1.png');
-      fs.renameSync(dir+`/${userid}_1.png`, dir+'/2.png');
-      fs.renameSync(dir+`/${userid}_2.png`, dir+'/3.png');
-      fs.renameSync(dir+`/${userid}_0.mp3`, dir+'/1.mp3');
-      fs.renameSync(dir+`/${userid}_1.mp3`, dir+'/2.mp3');
-      fs.renameSync(dir+`/${userid}_2.mp3`, dir+'/3.mp3');
-      fs.renameSync(dir+`/${userid}_0.json`, dir+'/transcription-1.json');
-      fs.renameSync(dir+`/${userid}_1.json`, dir+'/transcription-2.json');
-      fs.renameSync(dir+`/${userid}_2.json`, dir+'/transcription-3.json');
-    }
-  
-    const images = ['1.png', '2.png', '3.png'];
-    const audio = ['1.mp3', '2.mp3', '3.mp3'];
-    const transcriptions = [
-      'transcription-1.json',
-      'transcription-2.json',
-      'transcription-3.json'
-    ];
+    // Use /tmp for all file operations
+    const folderName = `assets_${userid}`;
+    const tmpDir = path.join('/tmp', folderName);
+    logger.info(`Starting video build process`, { userid, directory: tmpDir });
     
-    for (let i = 0; i < images.length; i++) {
-      const inputImage = path.join(dir, images[i]);
-      const inputAudio = path.join(dir, audio[i]);
-      const inputTranscription = path.join(dir, transcriptions[i]);
-      const outputVideo = path.join(dir, `output_${i}.mp4`);
-  
-      // Read the transcription file
-      const transcription = JSON.parse(fs.readFileSync(inputTranscription, 'utf8'));
-      const words = [...transcription];
-      const duration = parseFloat((transcription[transcription.length - 1].end)/1000).toFixed(2);
-        
-      // Create subtitle file
-      const subtitlePath = path.join(dir, `subtitles_${i}.srt`);
-      let subtitleContent = '';
-      let subtitleIndex = 1;
-      
-      // Group words into phrases for subtitles
-      let currentPhrase = [];
-      let currentStartTime = 0;
-      let currentEndTime = 0;
-      
-      for (let j = 0; j < words.length; j++) {
-        const word = words[j];
-        
-        if (currentPhrase.length === 0) {
-          currentStartTime = word.start;
-          currentPhrase.push(word.text);
-        } else if (currentPhrase.length < 5) {
-          currentPhrase.push(word.text);
-        }
-        
-        currentEndTime = word.end;
-        
-        if (currentPhrase.length === 5 || j === words.length - 1) {
-          const startTimeFormatted = formatTime(currentStartTime);
-          const endTimeFormatted = formatTime(currentEndTime);
-          
-          subtitleContent += `${subtitleIndex}\n`;
-          subtitleContent += `${startTimeFormatted} --> ${endTimeFormatted}\n`;
-          subtitleContent += `${currentPhrase.join(' ')}\n\n`;
-          
-          subtitleIndex++;
-          currentPhrase = [];
-        }
-      }
-      
-      fs.writeFileSync(subtitlePath, subtitleContent);
-  
-      try {
-        await new Promise((resolve, reject) => {
-          ffmpeg()
-            .input(inputImage)
-            .inputOptions(['-loop 1'])
-            .input(inputAudio)
-            .audioCodec('copy')
-            .videoCodec('libx264')
-            .outputOptions([
-              '-pix_fmt yuv420p',
-              '-shortest',
-              '-t', duration,
-              '-vf', `subtitles=${subtitlePath.replace(/\\/g, '\\\\').replace(/:/g, '\\:')}:force_style='FontSize=16,Alignment=2,BorderStyle=1,Outline=2,Shadow=1,MarginV=40'`
-            ])
-            .on('error', (err) => {
-              console.error('FFmpeg error:', err);
-              reject(err);
-            })
-            .on('end', () => {
-              console.log(`Video ${i+1} created successfully`);
-              resolve();
-            })
-            .save(outputVideo);
-        });
-      } catch (err) {
-        return null;
-      }
-    }
-  
-    // Create a concat file listing the files to concatenate
-    const concatFilePath = path.join(dir, 'concat.txt');
-    
-    // Use relative paths in the concat file to avoid path escaping issues
-    let concatFileContent = '';
-    for (let i = 0; i < 3; i++) {
-      concatFileContent += `file 'output_${i}.mp4'\n`;
-    }
-    
-    fs.writeFileSync(concatFilePath, concatFileContent);
-        
     try {
-      await new Promise((resolve, reject) => {
-        const command = ffmpeg()
-          .input(concatFilePath)
-          .inputOptions(['-f', 'concat', '-safe', '0'])
-          .outputOptions(['-c', 'copy'])
-          .on('start', commandLine => {
-            console.log('FFmpeg merge command:', commandLine);
-          })
-          .on('error', (err) => {
-            console.error('Merge error:', err);
-            reject(err);
-          })
-          .on('end', () => {
-            console.log('Merge completed successfully');
-            resolve();
-          })
-          .save(path.join(dir, 'final.mp4'));
-      });
-      return `${userid}/final.mp4`;
+        if (!fs.existsSync(path.join(tmpDir, '1.png'))) {
+          logger.debug(`Renaming files for video production`, { userid });
+          try {
+            fs.renameSync(path.join(tmpDir, `${userid}_0.png`), path.join(tmpDir, '1.png'));
+            fs.renameSync(path.join(tmpDir, `${userid}_1.png`), path.join(tmpDir, '2.png'));
+            fs.renameSync(path.join(tmpDir, `${userid}_2.png`), path.join(tmpDir, '3.png'));
+            fs.renameSync(path.join(tmpDir, `${userid}_0.mp3`), path.join(tmpDir, '1.mp3'));
+            fs.renameSync(path.join(tmpDir, `${userid}_1.mp3`), path.join(tmpDir, '2.mp3'));
+            fs.renameSync(path.join(tmpDir, `${userid}_2.mp3`), path.join(tmpDir, '3.mp3'));
+            fs.renameSync(path.join(tmpDir, `${userid}_0.json`), path.join(tmpDir, 'transcription-1.json'));
+            fs.renameSync(path.join(tmpDir, `${userid}_1.json`), path.join(tmpDir, 'transcription-2.json'));
+            fs.renameSync(path.join(tmpDir, `${userid}_2.json`), path.join(tmpDir, 'transcription-3.json'));
+          } catch (renameError) {
+            logger.error(`Error renaming files for video production`, renameError, { userid, directory: tmpDir });
+            throw renameError; // Rethrow to be caught by the outer try-catch
+          }
+        }
+      
+        const images = ['1.png', '2.png', '3.png'];
+        const audio = ['1.mp3', '2.mp3', '3.mp3'];
+        const transcriptions = [
+          'transcription-1.json',
+          'transcription-2.json',
+          'transcription-3.json'
+        ];
+        
+        // Validate all required files exist
+        for (const file of [...images, ...audio, ...transcriptions]) {
+          const filePath = path.join(tmpDir, file);
+          if (!fs.existsSync(filePath)) {
+            logger.error(`Required file missing for video production`, null, { missingFile: filePath });
+            return null;
+          }
+        }
+        
+        logger.info(`All required files verified for video production`, { userid });
+        
+        for (let i = 0; i < images.length; i++) {
+          const inputImage = path.join(tmpDir, images[i]);
+          const inputAudio = path.join(tmpDir, audio[i]);
+          const inputTranscription = path.join(tmpDir, transcriptions[i]);
+          const outputVideo = path.join(tmpDir, `output_${i}.mp4`);
+          
+          logger.debug(`Processing segment ${i+1}/3`, { inputImage, inputAudio, inputTranscription });
+      
+          // Read the transcription file
+          try {
+            const transcriptionContent = fs.readFileSync(inputTranscription, 'utf8');
+            const transcription = JSON.parse(transcriptionContent);
+            const words = [...transcription];
+            
+            if (!words.length || !words[words.length - 1]?.end) {
+              logger.error(`Invalid transcription format`, null, { 
+                inputTranscription, 
+                transcriptionSample: transcriptionContent.substring(0, 500) + '...'
+              });
+              return null;
+            }
+            
+            const duration = parseFloat((transcription[transcription.length - 1].end)/1000).toFixed(2);
+            logger.debug(`Segment ${i+1} duration calculated: ${duration}s`, { words: words.length });
+              
+            // Create subtitle file
+            const subtitlePath = path.join(tmpDir, `subtitles_${i}.srt`);
+            let subtitleContent = '';
+            let subtitleIndex = 1;
+            
+            // Group words into phrases for subtitles
+            let currentPhrase = [];
+            let currentStartTime = 0;
+            let currentEndTime = 0;
+            
+            for (let j = 0; j < words.length; j++) {
+              const word = words[j];
+              
+              if (currentPhrase.length === 0) {
+                currentStartTime = word.start;
+                currentPhrase.push(word.text);
+              } else if (currentPhrase.length < 5) {
+                currentPhrase.push(word.text);
+              }
+              
+              currentEndTime = word.end;
+              
+              if (currentPhrase.length === 5 || j === words.length - 1) {
+                const startTimeFormatted = formatTime(currentStartTime);
+                const endTimeFormatted = formatTime(currentEndTime);
+                
+                subtitleContent += `${subtitleIndex}\n`;
+                subtitleContent += `${startTimeFormatted} --> ${endTimeFormatted}\n`;
+                subtitleContent += `${currentPhrase.join(' ')}\n\n`;
+                
+                subtitleIndex++;
+                currentPhrase = [];
+              }
+            }
+            
+            fs.writeFileSync(subtitlePath, subtitleContent);
+            logger.debug(`Subtitle file created`, { subtitlePath, lines: subtitleIndex-1 });
+        
+            try {
+              logger.info(`Starting FFmpeg for segment ${i+1}`, { outputVideo });
+              await new Promise((resolve, reject) => {
+                ffmpeg()
+                  .input(inputImage)
+                  .inputOptions(['-loop 1'])
+                  .input(inputAudio)
+                  .audioCodec('copy')
+                  .videoCodec('libx264')
+                  .outputOptions([
+                    '-pix_fmt yuv420p',
+                    '-shortest',
+                    '-t', duration,
+                    '-vf', `subtitles=${subtitlePath.replace(/\\/g, '\\\\').replace(/:/g, '\\:')}:force_style='FontSize=16,Alignment=2,BorderStyle=1,Outline=2,Shadow=1,MarginV=40,MarginL=20,MarginR=20'`
+                  ])
+                  .on('start', commandLine => {
+                    logger.debug(`FFmpeg command for segment ${i+1}`, { commandLine });
+                  })
+                  .on('progress', progress => {
+                    logger.debug(`FFmpeg progress for segment ${i+1}`, { percent: progress.percent, fps: progress.frames });
+                  })
+                  .on('error', (err) => {
+                    logger.error(`FFmpeg error for segment ${i+1}`, err, { inputImage, inputAudio, subtitlePath });
+                    reject(err);
+                  })
+                  .on('end', () => {
+                    logger.info(`Video segment ${i+1} created successfully`, { outputVideo });
+                    resolve();
+                  })
+                  .save(outputVideo);
+              });
+            } catch (ffmpegError) {
+              logger.error(`FFmpeg process failed for segment ${i+1}`, ffmpegError);
+              return null;
+            }
+          } catch (transcriptionError) {
+            logger.error(`Error processing transcription for segment ${i+1}`, transcriptionError, { inputTranscription });
+            return null;
+          }
+        }
+      
+        // Create a concat file listing the files to concatenate
+        const concatFilePath = path.join(tmpDir, 'concat.txt');
+        
+        // Use relative paths in the concat file to avoid path escaping issues
+        let concatFileContent = '';
+        for (let i = 0; i < 3; i++) {
+          concatFileContent += `file 'output_${i}.mp4'\n`;
+        }
+        
+        fs.writeFileSync(concatFilePath, concatFileContent);
+        logger.debug(`Concat file created for final merge`, { concatFilePath, content: concatFileContent });
+            
+        try {
+          logger.info(`Starting final video merge`, { concatFilePath });
+          await new Promise((resolve, reject) => {
+            const command = ffmpeg()
+              .input(concatFilePath)
+              .inputOptions(['-f', 'concat', '-safe', '0'])
+              .outputOptions(['-c', 'copy'])
+              .on('start', commandLine => {
+                logger.debug('FFmpeg merge command:', { commandLine });
+              })
+              .on('progress', progress => {
+                logger.debug(`FFmpeg merge progress`, { percent: progress.percent, fps: progress.frames });
+              })
+              .on('error', (err) => {
+                logger.error('Merge error:', err, { concatFilePath });
+                reject(err);
+              })
+              .on('end', () => {
+                logger.info('Merge completed successfully', { outputPath: path.join(tmpDir, 'final.mp4') });
+                resolve();
+              })
+              .save(path.join(tmpDir, 'final.mp4'));
+          });
+          
+          const finalPath = path.join(tmpDir, 'final.mp4');
+          logger.info(`Video build process completed successfully`, { finalPath });
+          return finalPath;
+        } catch (mergeErr) {
+          logger.error('Final video merge failed', mergeErr);
+          return null;
+        }
     } catch (err) {
+      logger.error('Video build process failed', err, { userid });
       return null;
     }
   }
@@ -371,8 +543,28 @@ async function buildVideo(userid) {
   }
 
 exports.createVideo = async (req, res) => {
+    logger.info('createVideo function called', { 
+      requestBody: { 
+        ...req.body, 
+        // Don't log sensitive data if present
+        celebName: req.body?.celebName,
+        sports: req.body?.sports
+      },
+      userId: req.user?.id
+    });
 
-      const newVideo = {
+    // Ensure /tmp directory exists before anything else
+    try {
+      ensureTmpDirectoryExists();
+    } catch (error) {
+      return res.status(500).json({
+        success: false,
+        message: 'Server configuration error: Cannot use temporary storage',
+        error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      });
+    }
+
+    const newVideo = {
         title: '',
         url: '',
         thumbnail: '',
@@ -384,208 +576,346 @@ exports.createVideo = async (req, res) => {
         const userid = req?.user?.id;
 
         if (!userid || !isValidObjectId(userid)) {
+            logger.error('Invalid user ID provided', null, { userid });
             return res.status(400).json({ success: false, message: 'Invalid user ID' });
         }
         
-
         if (!celebName || !sports) {
+            logger.error('Missing required fields', null, { celebName: !!celebName, sports: !!sports });
             return res.status(400).json({ 
                 success: false, 
                 message: 'Must include celebName or sports' 
             });
         }
 
-
+        logger.info('Starting script generation', { celebName, sports });
         const getScript = await getImageAndContentPrompt(celebName, sports) || null;
-        // console.log(getScript);
-
-        // const getScript = [...testPromptData];
 
         if (!getScript) {
+            logger.error('Script generation failed', null, { celebName, sports });
             return res.status(500).json({
                 success: false,
-                message: 'Error creating video',
+                message: 'Error creating video: Failed to generate script',
             });
         }
 
+        logger.info(`Script generation successful, processing ${getScript.length} scenes`);
         const promises = [];
 
-        getScript.forEach((el, key)=>{
+        getScript.forEach((el, key) => {
+            logger.debug(`Setting up scene ${key+1} processing`, { 
+              contentTextLength: el.contentText?.length, 
+              imagePromptLength: el.imagePrompt?.length 
+            });
+            
             promises.push(new Promise(async (resolve) => {
-                const result = await convertTextToSpeech(el.contentText, userid, key);
-                resolve(result);
-              }));
+                try {
+                    const result = await convertTextToSpeech(el.contentText, userid, key);
+                    resolve(result);
+                } catch (error) {
+                    logger.error(`Text-to-speech processing failed for scene ${key+1}`, error, { 
+                      sceneIndex: key, 
+                      contentTextSample: el.contentText?.substring(0, 100) + '...' 
+                    });
+                    resolve(null);
+                }
+            }));
 
-              promises.push(new Promise(async (resolve) => {
-                const result = await generateImages(el.imagePrompt, userid, key);
-                resolve(result);
-              }));
+            promises.push(new Promise(async (resolve) => {
+                try {
+                    const result = await generateImages(el.imagePrompt, userid, key);
+                    resolve(result);
+                } catch (error) {
+                    logger.error(`Image generation failed for scene ${key+1}`, error, { 
+                      sceneIndex: key, 
+                      promptSample: el.imagePrompt?.substring(0, 100) + '...' 
+                    });
+                    resolve(null);
+                }
+            }));
         });
 
+        logger.info(`Processing ${promises.length} total jobs for speech and images`);
         Promise.all(promises)
         .then(async(results) => {
-            for (let i = 0; i < results.length; i++) {
-                if (!results[i]) {
+            logger.debug(`All speech and image generation jobs completed`, { resultsCount: results.length });
+            
+            // Check if any job failed
+            const failedJobs = results.filter(result => !result).length;
+            if (failedJobs > 0) {
+                logger.error(`${failedJobs} speech/image generation jobs failed`, null, { totalJobs: results.length });
+                await deleteFolder(userid);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Error creating video: Failed to generate speech or images',
+                });
+            }
+
+            logger.info(`Starting caption generation for ${getScript.length} scenes`);
+            const captionPromises = [];
+
+            for(let i = 0; i < 3; i++) {
+                captionPromises.push(new Promise(async (resolve) => {
+                    try {
+                        const result = await convertSpeechToCaption(userid, i);
+                        resolve(result);
+                    } catch (error) {
+                        logger.error(`Caption generation failed for scene ${i+1}`, error, { sceneIndex: i });
+                        resolve(null);
+                    }
+                }));
+            }
+      
+            logger.debug(`Processing ${captionPromises.length} caption generation jobs`);
+            Promise.all(captionPromises)
+            .then(async(results) => {
+                logger.debug(`All caption generation jobs completed`, { resultsCount: results.length });
+                
+                // Check if any caption job failed
+                const failedCaptionJobs = results.filter(result => !result).length;
+                if (failedCaptionJobs > 0) {
+                    logger.error(`${failedCaptionJobs} caption generation jobs failed`, null, { totalJobs: results.length });
                     await deleteFolder(userid);
-                        return res.status(500).json({
+                    return res.status(500).json({
                         success: false,
-                        message: 'Error creating video',
+                        message: 'Error creating video: Failed to generate captions',
                     });
                 }
-              }
 
-              const captionPromises = [];
+                logger.info(`Starting video build process`, { userid });
+                const videoBuilt = await buildVideo(userid);
 
-              for(let i = 0; i < 3; i++) {
-                  captionPromises.push(new Promise(async (resolve) => {
-                      const result = await convertSpeechToCaption(userid, i);
-                      resolve(result);
-                    }));
-              }
-      
-              Promise.all(captionPromises)
-              .then(async(results) => {
-                  for (let i = 0; i < results.length; i++) {
-                      if (!results[i]) {
-                          await deleteFolder(userid);
-                              return res.status(500).json({
-                              success: false,
-                              message: 'Error creating video',
-                          });
-                      }
+                if(!videoBuilt) {
+                    logger.error(`Video build process failed`, null, { userid });
+                    await deleteFolder(userid);
+                    return res.status(500).json({
+                        success: false,
+                        message: 'Error creating video: Failed to build final video',
+                    });
+                }
+
+                logger.info(`Video build successful, preparing for S3 upload`, { videoPath: videoBuilt });
+                const videoFileName = `${createRandomHex(32)}_videoFile`;
+                const thumbnailFileName = `${createRandomHex(32)}_thumbnailFile`;
+
+                // Store a meaningful title
+                newVideo.title = `${celebName} - ${sports}` || 'Untitled Video'; 
+
+                try {
+                    logger.debug(`Reading video and thumbnail files`, { 
+                      videoFile: videoBuilt, 
+                      thumbnailFile: path.join('/tmp', `assets_${userid}`, '1.png') 
+                    });
+                    
+                    const videoFilePath = videoBuilt;
+                    const thumbnailFilePath = path.join('/tmp', `assets_${userid}`, '1.png');
+                    
+                    if (!fs.existsSync(videoFilePath) || !fs.existsSync(thumbnailFilePath)) {
+                        throw new Error(`Required files missing: video=${fs.existsSync(videoFilePath)}, thumbnail=${fs.existsSync(thumbnailFilePath)}`);
                     }
-
-                    const videoBuilt = await buildVideo(userid);
-
-                    if(!videoBuilt) {
-                      await deleteFolder(userid);
-                              return res.status(500).json({
-                              success: false,
-                              message: 'Error creating video',
-                          });
+                    
+                    const videoFile = fs.readFileSync(videoFilePath);
+                    const thumbnailFile = fs.readFileSync(thumbnailFilePath);
+                    
+                    logger.debug(`Files read successfully`, { 
+                      videoSize: videoFile.length, 
+                      thumbnailSize: thumbnailFile.length 
+                    });
+                    
+                    // Fix: Set proper content types explicitly
+                    const videoParams = {
+                        Bucket: process.env.AWS_BUCKET_NAME,
+                        Key: videoFileName,
+                        Body: videoFile,
+                        ContentType: 'video/mp4'
+                    };
+                
+                    const thumbnailParams = {
+                        Bucket: process.env.AWS_BUCKET_NAME,
+                        Key: thumbnailFileName,
+                        Body: thumbnailFile,
+                        ContentType: 'image/png'
+                    };
+                
+                    // Upload files to S3
+                    logger.info(`Uploading files to S3`, { 
+                      bucket: process.env.AWS_BUCKET_NAME, 
+                      videoKey: videoFileName, 
+                      thumbnailKey: thumbnailFileName 
+                    });
+                    
+                    const putVideoCommand = new PutObjectCommand(videoParams);
+                    const putThumbnailCommand = new PutObjectCommand(thumbnailParams);
+                
+                    try {
+                        await s3.send(putVideoCommand);
+                        logger.info(`Video uploaded to S3 successfully`, { key: videoFileName });
+                    } catch (uploadError) {
+                        logger.error(`Failed to upload video to S3`, uploadError, { key: videoFileName });
+                        throw uploadError;
                     }
-
-                    const videoFileName = `${createRandomHex(32)}_videoFile`;
-const thumbnailFileName = `${createRandomHex(32)}_thumbnailFile`;
-
-// Fix: Store original title from user input rather than using filename
-newVideo.title = videoFileName || 'Untitled Video'; 
-
-        try {
-          const videoFile = fs.readFileSync(`assets_${userid}/final.mp4`);
-          const thumbnailFile = fs.readFileSync(`assets_${userid}/1.png`);
-          
-          // Fix: Set proper content types explicitly
-          const videoParams = {
-            Bucket: process.env.AWS_BUCKET_NAME,
-            Key: videoFileName,
-            Body: videoFile.buffer,
-            ContentType: 'video/mp4'
-          };
-        
-          const thumbnailParams = {
-            Bucket: process.env.AWS_BUCKET_NAME,
-            Key: thumbnailFileName,
-            Body: thumbnailFile.buffer,
-            ContentType: 'image/png'
-          };
-        
-          // Upload files to S3
-          const putVideoCommand = new PutObjectCommand(videoParams);
-          const putThumbnailCommand = new PutObjectCommand(thumbnailParams);
-        
-          await s3.send(putVideoCommand);
-          await s3.send(putThumbnailCommand);
-
-          await deleteFolder(userid);
-        
-          const getVideoCommand = new GetObjectCommand({
-            Bucket: process.env.AWS_BUCKET_NAME,
-            Key: videoFileName,
-          });
-          
-          const getThumbnailCommand = new GetObjectCommand({
-            Bucket: process.env.AWS_BUCKET_NAME,
-            Key: thumbnailFileName,
-          });
-        
-          // Get signed URLs
-          newVideo.url = await getSignedUrl(s3, getVideoCommand, { expiresIn: 6*24*60*60 });
-          newVideo.thumbnail = await getSignedUrl(s3, getThumbnailCommand, { expiresIn: 6*24*60*60 });
-        
-          // Validate the video object
-          if (!newVideo?.title || !newVideo?.url || !newVideo?.thumbnail) {
-            throw new Error('Missing required video properties');
-          }
-        
-          // Fix: Store video objects directly without stringification
-          let videoCollection = await Videos.findOne({ userid });
-  
-  if (videoCollection) {
-    // Parse the existing array, add the new video, then stringify again
-    const videoArr = JSON.parse(videoCollection.videoArr || '[]');
-    videoArr.push(newVideo);
-    
-    // Fix: Store as stringified JSON to match schema expectation
-    videoCollection.videoArr = JSON.stringify(videoArr);
-    
-    await videoCollection.save();
-    
-    return res.status(200).json({
-      success: true,
-      message: 'Video added to collection',
-      data: newVideo // Return the new video
-    });
-  } else {
-    // Create new collection for user
-    videoCollection = new Videos({
-      userid,
-      videoArr: JSON.stringify([newVideo]) // Keep as string to match schema
-    });
-    
-    await videoCollection.save();
-    
-    await deleteFolder(userid);
-    return res.status(201).json({
-      success: true,
-      message: 'New video collection created',
-      data: newVideo // Return just the new video
-    });
-  }
-        } catch (error) {
-            await deleteFolder(userid);
-            return res.status(500).json({
-              success: false,
-              message: 'Error processing video',
-              error: error.message
+                    
+                    try {
+                        await s3.send(putThumbnailCommand);
+                        logger.info(`Thumbnail uploaded to S3 successfully`, { key: thumbnailFileName });
+                    } catch (uploadError) {
+                        logger.error(`Failed to upload thumbnail to S3`, uploadError, { key: thumbnailFileName });
+                        throw uploadError;
+                    }
+                
+                    logger.debug(`Cleaning up temporary files`);
+                    await deleteFolder(userid);
+                
+                    logger.info(`Generating signed URLs for S3 objects`);
+                    const getVideoCommand = new GetObjectCommand({
+                        Bucket: process.env.AWS_BUCKET_NAME,
+                        Key: videoFileName,
+                    });
+                    
+                    const getThumbnailCommand = new GetObjectCommand({
+                        Bucket: process.env.AWS_BUCKET_NAME,
+                        Key: thumbnailFileName,
+                    });
+                
+                    try {
+                        // Get signed URLs
+                        const videoUrl = await getSignedUrl(s3, getVideoCommand, { expiresIn: 6*24*60*60 });
+                        const thumbnailUrl = await getSignedUrl(s3, getThumbnailCommand, { expiresIn: 6*24*60*60 });
+                        
+                        logger.debug(`Generated signed URLs successfully`);
+                        newVideo.url = videoUrl;
+                        newVideo.thumbnail = thumbnailUrl;
+                    } catch (signedUrlError) {
+                        logger.error(`Failed to generate signed URLs`, signedUrlError, { 
+                          videoKey: videoFileName, 
+                          thumbnailKey: thumbnailFileName 
+                        });
+                        throw signedUrlError;
+                    }
+                
+                    // Validate the video object
+                    if (!newVideo?.title || !newVideo?.url || !newVideo?.thumbnail) {
+                        logger.error(`Missing required video properties`, null, { 
+                          hasTitle: !!newVideo?.title, 
+                          hasUrl: !!newVideo?.url, 
+                          hasThumbnail: !!newVideo?.thumbnail 
+                        });
+                        throw new Error('Missing required video properties');
+                    }
+                
+                    logger.info(`Storing video in database for user`, { userid });
+                    // Fix: Store video objects directly without stringification
+                    let videoCollection = await Videos.findOne({ userid });
+            
+                    if (videoCollection) {
+                        logger.debug(`Found existing video collection for user`, { userid });
+                        // Parse the existing array, add the new video, then stringify again
+                        let videoArr = [];
+                        try {
+                            videoArr = JSON.parse(videoCollection.videoArr || '[]');
+                            logger.debug(`Successfully parsed existing video array`, { existingVideos: videoArr.length });
+                        } catch (parseError) {
+                            logger.error(`Failed to parse existing video array`, parseError, { 
+                              videoArrSample: videoCollection.videoArr?.substring(0, 200) + '...' 
+                            });
+                            videoArr = [];
+                        }
+                        
+                        videoArr.push(newVideo);
+                        
+                        // Fix: Store as stringified JSON to match schema expectation
+                        videoCollection.videoArr = JSON.stringify(videoArr);
+                        
+                        try {
+                            await videoCollection.save();
+                            logger.info(`Successfully updated video collection for user`, { 
+                              userid, 
+                              totalVideos: videoArr.length 
+                            });
+                        } catch (saveError) {
+                            logger.error(`Failed to save updated video collection`, saveError, { userid });
+                            throw saveError;
+                        }
+                        
+                        return res.status(200).json({
+                            success: true,
+                            message: 'Video added to collection',
+                            data: newVideo // Return the new video
+                        });
+                    } else {
+                        logger.debug(`No existing collection found, creating new one`, { userid });
+                        // Create new collection for user
+                        videoCollection = new Videos({
+                            userid,
+                            videoArr: JSON.stringify([newVideo]) // Keep as string to match schema
+                        });
+                        
+                        try {
+                            await videoCollection.save();
+                            logger.info(`Successfully created new video collection for user`, { userid });
+                        } catch (saveError) {
+                            logger.error(`Failed to create new video collection`, saveError, { userid });
+                            throw saveError;
+                        }
+                        
+                        return res.status(201).json({
+                            success: true,
+                            message: 'New video collection created',
+                            data: newVideo // Return just the new video
+                        });
+                    }
+                } catch (error) {
+                    logger.error(`S3 upload or database operation failed`, error, { 
+                      userid,
+                      videoFileName,
+                      thumbnailFileName
+                    });
+                    
+                    // Ensure cleanup happens even on error
+                    await deleteFolder(userid);
+                    
+                    return res.status(500).json({
+                        success: false,
+                        message: 'Error processing video: ' + (error.message || 'Unknown error'),
+                        error: process.env.NODE_ENV === 'development' ? error.stack : undefined
+                    });
+                }
+            })
+            .catch(async(error) => {
+                logger.error(`Caption generation promise chain failed`, error, { userid });
+                await deleteFolder(userid);
+                return res.status(500).json({
+                    success: false,
+                    message: 'Error creating video: Failed during caption generation',
+                    error: process.env.NODE_ENV === 'development' ? error.stack : undefined
+                });
             });
-        }
-
-
-              })
-              .catch(async(error) => {
-                  await deleteFolder(userid);
-                  return res.status(500).json({
-                      success: false,
-                      message: 'Error creating video caption catch',
-                      error: error.message
-                  });
-              });
         })
         .catch(async(error) => {
+            logger.error(`Speech/image generation promise chain failed`, error, { userid });
             await deleteFolder(userid);
             return res.status(500).json({
                 success: false,
-                message: 'Error creating video in outer catch',
-                error: error.message
+                message: 'Error creating video: Failed during speech or image generation',
+                error: process.env.NODE_ENV === 'development' ? error.stack : undefined
             });
         });
     } catch (error) {
-      await deleteFolder(req.user.id);
+        logger.error(`Top-level error in createVideo function`, error, { 
+          userid: req?.user?.id,
+          body: { celebName: req.body?.celebName, sports: req.body?.sports }
+        });
+        
+        try {
+            await deleteFolder(req?.user?.id);
+        } catch (cleanupError) {
+            logger.error(`Failed to clean up after top-level error`, cleanupError, { userid: req?.user?.id });
+        }
+        
         return res.status(500).json({
             success: false,
-            message: 'Error creating video in outter most catch',
-            error: error.message
+            message: 'Error creating video: ' + (error.message || 'Unexpected error occurred'),
+            error: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     }
 };
