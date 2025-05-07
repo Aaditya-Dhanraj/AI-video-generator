@@ -3,7 +3,7 @@ import axios from 'axios';
 const instance = axios.create({
   // baseURL: 'https://ai-video-generator-server.vercel.app/api'
   // baseURL: 'http://localhost:8080/api'
-  baseURL: process.env.BASE_URL
+  baseURL: 'http://18.212.38.93:8080/api'
 });
 
 // Interceptor to attach token
