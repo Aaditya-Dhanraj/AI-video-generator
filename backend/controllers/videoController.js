@@ -69,10 +69,10 @@ const ensureTmpDirectoryExists = () => {
   try {
     if (!fs.existsSync('/tmp')) {
       fs.mkdirSync('/tmp', { recursive: true });
-      logger.info('Created /tmp directory');
+      console.log('[INFO] Created /tmp directory');
     }
   } catch (error) {
-    logger.error('Error ensuring /tmp directory exists', error);
+    console.error('[ERROR] Error ensuring /tmp directory exists', error);
     // If we can't create /tmp, we're in a serious environment issue
     throw new Error('Cannot create /tmp directory for file operations');
   }
@@ -84,11 +84,11 @@ const createTmpFolder = (folderName) => {
   try {
     if (!fs.existsSync(fullPath)) {
       fs.mkdirSync(fullPath, { recursive: true });
-      logger.debug(`Created folder ${fullPath}`);
+      console.log(`[DEBUG] Created folder ${fullPath}`);
     }
     return fullPath;
   } catch (error) {
-    logger.error(`Error creating folder ${fullPath}`, error);
+    console.error(`[ERROR] Error creating folder ${fullPath}`, error);
     throw error;
   }
 };
@@ -203,14 +203,14 @@ async function convertTextToSpeech(contentText, fileId, key) {
     const text = contentText || null;
 
     if(!text) {
-        logger.warn(`Empty text content for speech conversion`, { fileId, key });
+        console.warn(`[WARN] Empty text content for speech conversion`, { fileId, key });
         return null;
     }
 
     // Create folder in /tmp
     const folderName = `assets_${fileId}`;
     const tmpFolderPath = createTmpFolder(folderName);
-    logger.debug(`Converting text to speech`, { fileId, key, textLength: text.length });
+    console.log(`[DEBUG] Converting text to speech`, { fileId, key, textLength: text.length });
 
     try {
         const request = {
@@ -222,14 +222,14 @@ async function convertTextToSpeech(contentText, fileId, key) {
         const [response] = await textToSpeechClient.synthesizeSpeech(request);
 
         const filePath = path.join(tmpFolderPath, `${fileId}_${key}.mp3`);
-        logger.debug(`Speech synthesis complete, writing to ${filePath}`);
+        console.log(`[DEBUG] Speech synthesis complete, writing to ${filePath}`);
 
         const writeFile = util.promisify(fs.writeFile);
         await writeFile(filePath, response.audioContent, 'binary');
-        logger.info(`Successfully created speech file`, { filePath });
+        console.log(`[INFO] Successfully created speech file`, { filePath });
         return true;
     } catch (error) {
-        logger.error('Error in convertTextToSpeech', error, { fileId, key, text: text.substring(0, 100) });
+        console.error('[ERROR] Error in convertTextToSpeech', error, { fileId, key, text: text.substring(0, 100) });
         return null;
     }
 }
@@ -612,7 +612,7 @@ async function buildVideo(userid) {
   }
 
 exports.createVideo = async (req, res) => {
-    logger.info('createVideo function called', { 
+    console.log('[INFO] createVideo function called', { 
       requestBody: { 
         ...req.body, 
         // Don't log sensitive data if present
