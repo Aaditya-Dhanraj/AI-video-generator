@@ -19,22 +19,49 @@ const sharp = require('sharp');
 ffmpeg.setFfmpegPath(ffmpegPath);
 dotenv.config();
 
-// Create a central logger
-const logger = {
-  info: (message, meta = {}) => {
-    console.log(`[INFO] ${new Date().toISOString()} - ${message}`, meta);
-  },
-  error: (message, error = null, meta = {}) => {
-    console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, error ? { error: error.stack || error.message || error, ...meta } : meta);
-  },
-  warn: (message, meta = {}) => {
-    console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, meta);
-  },
-  debug: (message, meta = {}) => {
-    if (process.env.DEBUG) {
-      console.debug(`[DEBUG] ${new Date().toISOString()} - ${message}`, meta);
+// Dynamically set FFmpeg path based on environment
+const getFfmpegPath = () => {
+  try {
+    // Try to get the path from ffmpeg-static
+    const ffmpegStatic = require('ffmpeg-static');
+    logger.info(`FFmpeg static path: ${ffmpegStatic}`);
+    
+    // Check if the file exists at this path
+    if (fs.existsSync(ffmpegStatic)) {
+      logger.info(`FFmpeg binary exists at static path`);
+      return ffmpegStatic;
+    } else {
+      logger.warn(`FFmpeg binary not found at static path, checking alternatives`);
+    }
+  } catch (err) {
+    logger.warn(`Could not load ffmpeg-static module: ${err.message}`);
+  }
+  
+  // Check environment-specific paths
+  const possiblePaths = [
+    // Standard ffmpeg-static path
+    '/var/task/node_modules/ffmpeg-static/ffmpeg',
+    // Common Vercel serverless location
+    '/tmp/ffmpeg',
+    // Current working directory
+    path.join(process.cwd(), 'node_modules/ffmpeg-static/ffmpeg'),
+    // Global PATH lookup (may not work in serverless)
+    'ffmpeg'
+  ];
+  
+  for (const binPath of possiblePaths) {
+    try {
+      if (fs.existsSync(binPath)) {
+        logger.info(`Found FFmpeg binary at ${binPath}`);
+        return binPath;
+      }
+    } catch (err) {
+      logger.debug(`Error checking path ${binPath}: ${err.message}`);
     }
   }
+  
+  logger.error(`Could not find FFmpeg binary in any location`);
+  throw new Error('FFmpeg binary not found in any expected location');
 };
 
 // Ensure tmp directory exists (for Vercel serverless functions)
@@ -342,6 +369,16 @@ async function buildVideo(userid) {
     logger.info(`Starting video build process`, { userid, directory: tmpDir });
     
     try {
+        // Try to set FFmpeg path dynamically
+        try {
+            const ffmpegBinaryPath = getFfmpegPath();
+            logger.info(`Using FFmpeg binary at: ${ffmpegBinaryPath}`);
+            ffmpeg.setFfmpegPath(ffmpegBinaryPath);
+        } catch (error) {
+            logger.error(`Failed to set FFmpeg path`, error);
+            throw new Error(`FFmpeg binary not found: ${error.message}`);
+        }
+        
         if (!fs.existsSync(path.join(tmpDir, '1.png'))) {
           logger.debug(`Renaming files for video production`, { userid });
           try {
