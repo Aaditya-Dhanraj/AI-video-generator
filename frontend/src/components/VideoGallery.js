@@ -21,7 +21,7 @@ const VideoGallery = () => {
   const fetchVideos = async () => {
     setLoading(true);
     try {
-      const response = await axiosInstance.get('http://localhost:8080/api/update');
+      const response = await axiosInstance.get('https://ai-video-generator-server.vercel.app/api/update');
       if (response.data.success) {
         // Parse the videoArr string to an actual array
         const parsedVideos = JSON.parse(response.data.videoArr);
@@ -52,7 +52,7 @@ const VideoGallery = () => {
     setError(null);
     
     try {
-      const response = await axiosInstance.post('http://localhost:8080/api/videos', {
+      const response = await axiosInstance.post('https://ai-video-generator-server.vercel.app/api/videos', {
         celebName: celebrityName,
         sports: expertise,
       });
@@ -96,7 +96,7 @@ const VideoGallery = () => {
 
     setIsDeleting(true);
     try {
-      const response = await axiosInstance.post(`http://localhost:8080/api/update?videoId=${videoId}`);
+      const response = await axiosInstance.post(`https://ai-video-generator-server.vercel.app/api/update?videoId=${videoId}`);
       
       if (response.data.success) {
         // Remove the deleted video from state
