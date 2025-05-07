@@ -379,152 +379,184 @@ async function buildVideo(userid) {
         
         logger.info(`All required files verified for video production`, { userid });
         
+        // Create a directory for video segments
+        const segmentsDir = path.join(tmpDir, 'segments');
+        if (!fs.existsSync(segmentsDir)) {
+          fs.mkdirSync(segmentsDir, { recursive: true });
+        }
+        
+        // Generate each segment separately
+        const segmentPromises = [];
+        
         for (let i = 0; i < images.length; i++) {
-          const inputImage = path.join(tmpDir, images[i]);
-          const inputAudio = path.join(tmpDir, audio[i]);
-          const inputTranscription = path.join(tmpDir, transcriptions[i]);
-          const outputVideo = path.join(tmpDir, `output_${i}.mp4`);
-          
-          logger.debug(`Processing segment ${i+1}/3`, { inputImage, inputAudio, inputTranscription });
-      
-          // Read the transcription file
-          try {
-            const transcriptionContent = fs.readFileSync(inputTranscription, 'utf8');
-            const transcription = JSON.parse(transcriptionContent);
-            const words = [...transcription];
-            
-            if (!words.length || !words[words.length - 1]?.end) {
-              logger.error(`Invalid transcription format`, null, { 
-                inputTranscription, 
-                transcriptionSample: transcriptionContent.substring(0, 500) + '...'
-              });
-              return null;
-            }
-            
-            const duration = parseFloat((transcription[transcription.length - 1].end)/1000).toFixed(2);
-            logger.debug(`Segment ${i+1} duration calculated: ${duration}s`, { words: words.length });
-              
-            // Create subtitle file
-            const subtitlePath = path.join(tmpDir, `subtitles_${i}.srt`);
-            let subtitleContent = '';
-            let subtitleIndex = 1;
-            
-            // Group words into phrases for subtitles
-            let currentPhrase = [];
-            let currentStartTime = 0;
-            let currentEndTime = 0;
-            
-            for (let j = 0; j < words.length; j++) {
-              const word = words[j];
-              
-              if (currentPhrase.length === 0) {
-                currentStartTime = word.start;
-                currentPhrase.push(word.text);
-              } else if (currentPhrase.length < 5) {
-                currentPhrase.push(word.text);
-              }
-              
-              currentEndTime = word.end;
-              
-              if (currentPhrase.length === 5 || j === words.length - 1) {
-                const startTimeFormatted = formatTime(currentStartTime);
-                const endTimeFormatted = formatTime(currentEndTime);
+          segmentPromises.push(
+            new Promise(async (resolve, reject) => {
+              try {
+                const inputImage = path.join(tmpDir, images[i]);
+                const inputAudio = path.join(tmpDir, audio[i]);
+                const inputTranscription = path.join(tmpDir, transcriptions[i]);
+                const outputVideo = path.join(segmentsDir, `segment_${i}.mp4`);
                 
-                subtitleContent += `${subtitleIndex}\n`;
-                subtitleContent += `${startTimeFormatted} --> ${endTimeFormatted}\n`;
-                subtitleContent += `${currentPhrase.join(' ')}\n\n`;
+                logger.debug(`Processing segment ${i+1}/3`, { inputImage, inputAudio, inputTranscription });
+            
+                // Read the transcription file
+                const transcriptionContent = fs.readFileSync(inputTranscription, 'utf8');
+                const transcription = JSON.parse(transcriptionContent);
+                const words = [...transcription];
                 
-                subtitleIndex++;
-                currentPhrase = [];
+                if (!words.length || !words[words.length - 1]?.end) {
+                  logger.error(`Invalid transcription format`, null, { 
+                    inputTranscription, 
+                    transcriptionSample: transcriptionContent.substring(0, 500) + '...'
+                  });
+                  return reject(new Error(`Invalid transcription format for segment ${i+1}`));
+                }
+                
+                const duration = parseFloat((transcription[transcription.length - 1].end)/1000).toFixed(2);
+                logger.debug(`Segment ${i+1} duration calculated: ${duration}s`, { words: words.length });
+                  
+                // Create subtitle file - simplify to plain SRT without fancy styling
+                const subtitlePath = path.join(tmpDir, `subtitles_${i}.srt`);
+                let subtitleContent = '';
+                let subtitleIndex = 1;
+                
+                // Group words into phrases for subtitles - larger groups of 10 words instead of 5
+                let currentPhrase = [];
+                let currentStartTime = 0;
+                let currentEndTime = 0;
+                
+                for (let j = 0; j < words.length; j++) {
+                  const word = words[j];
+                  
+                  if (currentPhrase.length === 0) {
+                    currentStartTime = word.start;
+                    currentPhrase.push(word.text);
+                  } else if (currentPhrase.length < 10) { // Increased from 5 to 10 words per line
+                    currentPhrase.push(word.text);
+                  }
+                  
+                  currentEndTime = word.end;
+                  
+                  if (currentPhrase.length === 10 || j === words.length - 1) {
+                    const startTimeFormatted = formatTime(currentStartTime);
+                    const endTimeFormatted = formatTime(currentEndTime);
+                    
+                    subtitleContent += `${subtitleIndex}\n`;
+                    subtitleContent += `${startTimeFormatted} --> ${endTimeFormatted}\n`;
+                    subtitleContent += `${currentPhrase.join(' ')}\n\n`;
+                    
+                    subtitleIndex++;
+                    currentPhrase = [];
+                  }
+                }
+                
+                fs.writeFileSync(subtitlePath, subtitleContent);
+                logger.debug(`Subtitle file created`, { subtitlePath, lines: subtitleIndex-1 });
+            
+                // Simplify FFmpeg command with minimal options
+                await new Promise((ffmpegResolve, ffmpegReject) => {
+                  ffmpeg()
+                    .input(inputImage)
+                    .inputOptions(['-loop 1'])
+                    .input(inputAudio)
+                    .audioCodec('copy')
+                    .videoCodec('libx264')
+                    .outputOptions([
+                      '-pix_fmt yuv420p',
+                      '-shortest',
+                      '-t', duration,
+                      '-vf', `subtitles=${subtitlePath.replace(/\\/g, '\\\\').replace(/:/g, '\\:')}`
+                    ])
+                    .on('start', commandLine => {
+                      logger.debug(`FFmpeg command for segment ${i+1}`, { commandLine });
+                    })
+                    .on('progress', progress => {
+                      logger.debug(`FFmpeg progress for segment ${i+1}`, { 
+                        percent: progress.percent || 'N/A', 
+                        frames: progress.frames || 'N/A' 
+                      });
+                    })
+                    .on('error', (err) => {
+                      logger.error(`FFmpeg error for segment ${i+1}`, err, { 
+                        inputImage, 
+                        inputAudio, 
+                        subtitlePath,
+                        command: err.message 
+                      });
+                      ffmpegReject(err);
+                    })
+                    .on('end', () => {
+                      logger.info(`Video segment ${i+1} created successfully`, { outputVideo });
+                      ffmpegResolve();
+                    })
+                    .save(outputVideo);
+                });
+                
+                resolve(outputVideo);
+              } catch (error) {
+                logger.error(`Error processing segment ${i+1}`, error);
+                reject(error);
               }
-            }
-            
-            fs.writeFileSync(subtitlePath, subtitleContent);
-            logger.debug(`Subtitle file created`, { subtitlePath, lines: subtitleIndex-1 });
-        
-            try {
-              logger.info(`Starting FFmpeg for segment ${i+1}`, { outputVideo });
-              await new Promise((resolve, reject) => {
-                ffmpeg()
-                  .input(inputImage)
-                  .inputOptions(['-loop 1'])
-                  .input(inputAudio)
-                  .audioCodec('copy')
-                  .videoCodec('libx264')
-                  .outputOptions([
-                    '-pix_fmt yuv420p',
-                    '-shortest',
-                    '-t', duration,
-                    '-vf', `subtitles=${subtitlePath.replace(/\\/g, '\\\\').replace(/:/g, '\\:')}:force_style='FontSize=16,Alignment=2,BorderStyle=1,Outline=2,Shadow=1,MarginV=40,MarginL=20,MarginR=20'`
-                  ])
-                  .on('start', commandLine => {
-                    logger.debug(`FFmpeg command for segment ${i+1}`, { commandLine });
-                  })
-                  .on('progress', progress => {
-                    logger.debug(`FFmpeg progress for segment ${i+1}`, { percent: progress.percent, fps: progress.frames });
-                  })
-                  .on('error', (err) => {
-                    logger.error(`FFmpeg error for segment ${i+1}`, err, { inputImage, inputAudio, subtitlePath });
-                    reject(err);
-                  })
-                  .on('end', () => {
-                    logger.info(`Video segment ${i+1} created successfully`, { outputVideo });
-                    resolve();
-                  })
-                  .save(outputVideo);
-              });
-            } catch (ffmpegError) {
-              logger.error(`FFmpeg process failed for segment ${i+1}`, ffmpegError);
-              return null;
-            }
-          } catch (transcriptionError) {
-            logger.error(`Error processing transcription for segment ${i+1}`, transcriptionError, { inputTranscription });
-            return null;
-          }
-        }
-      
-        // Create a concat file listing the files to concatenate
-        const concatFilePath = path.join(tmpDir, 'concat.txt');
-        
-        // Use relative paths in the concat file to avoid path escaping issues
-        let concatFileContent = '';
-        for (let i = 0; i < 3; i++) {
-          concatFileContent += `file 'output_${i}.mp4'\n`;
+            })
+          );
         }
         
-        fs.writeFileSync(concatFilePath, concatFileContent);
-        logger.debug(`Concat file created for final merge`, { concatFilePath, content: concatFileContent });
-            
         try {
-          logger.info(`Starting final video merge`, { concatFilePath });
+          const segmentResults = await Promise.all(segmentPromises);
+          logger.info(`All segments created successfully`, { segments: segmentResults });
+          
+          // Create a concat file for joining segments
+          const concatFilePath = path.join(tmpDir, 'concat.txt');
+          let concatFileContent = '';
+          
+          for (let i = 0; i < segmentResults.length; i++) {
+            // Use relative paths from the directory where ffmpeg will be executed
+            const relativePath = path.relative(tmpDir, segmentResults[i]).replace(/\\/g, '/');
+            concatFileContent += `file '${relativePath}'\n`;
+          }
+          
+          fs.writeFileSync(concatFilePath, concatFileContent);
+          logger.info(`Created concat file for merging segments`, { 
+            concatFilePath, 
+            content: concatFileContent 
+          });
+          
+          // Final merge to create the full video
+          const finalVideoPath = path.join(tmpDir, 'final.mp4');
+          
           await new Promise((resolve, reject) => {
-            const command = ffmpeg()
+            // Change working directory to tmpDir before running ffmpeg
+            const currentDir = process.cwd();
+            process.chdir(tmpDir);
+            
+            ffmpeg()
               .input(concatFilePath)
               .inputOptions(['-f', 'concat', '-safe', '0'])
               .outputOptions(['-c', 'copy'])
               .on('start', commandLine => {
-                logger.debug('FFmpeg merge command:', { commandLine });
-              })
-              .on('progress', progress => {
-                logger.debug(`FFmpeg merge progress`, { percent: progress.percent, fps: progress.frames });
+                logger.debug(`FFmpeg merge command`, { commandLine });
               })
               .on('error', (err) => {
-                logger.error('Merge error:', err, { concatFilePath });
+                process.chdir(currentDir); // Change back to original directory
+                logger.error(`Final merge error`, err, { 
+                  concatFilePath,
+                  command: err.message
+                });
                 reject(err);
               })
               .on('end', () => {
-                logger.info('Merge completed successfully', { outputPath: path.join(tmpDir, 'final.mp4') });
+                process.chdir(currentDir); // Change back to original directory
+                logger.info(`Final video merge completed successfully`, { finalVideoPath });
                 resolve();
               })
-              .save(path.join(tmpDir, 'final.mp4'));
+              .save(finalVideoPath);
           });
           
-          const finalPath = path.join(tmpDir, 'final.mp4');
-          logger.info(`Video build process completed successfully`, { finalPath });
-          return finalPath;
-        } catch (mergeErr) {
-          logger.error('Final video merge failed', mergeErr);
-          return null;
+          logger.info(`Video build process completed successfully`, { finalVideoPath });
+          return finalVideoPath;
+        } catch (error) {
+          logger.error(`Error processing video segments`, error);
+          throw error;
         }
     } catch (err) {
       logger.error('Video build process failed', err, { userid });
