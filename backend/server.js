@@ -18,10 +18,10 @@ const server = require('http').createServer(app);
 server.timeout = 300000;
 
 const corsOptions = {
-    origin: ['*'], // Allow all origins - for development only! For production, specify your frontend URL
+    origin: 'https://aadityadhanraj.com',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-    credentials: false, // Allow cookies to be sent with requests
+    credentials: true, // Allow cookies to be sent with requests
     preflightContinue: false,
     optionsSuccessStatus: 204
   };
@@ -29,8 +29,6 @@ const corsOptions = {
 app.use(bodyParser.json());
 app.use(cors(corsOptions));
 app.use(express.json());
-
-app.options('*', cors(corsOptions));
 
 // API Routes
 app.use('/api/auth', authRoutes);

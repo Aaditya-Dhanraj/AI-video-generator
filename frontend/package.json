@@ -1,7 +1,7 @@
 {
   "name": "frontend",
   "version": "0.1.0",
-  "proxy": "https://www.aadityadhanraj.com/api",
+  "proxy": "https://aadityadhanraj.com",
   "private": true,
   "dependencies": {
     "@testing-library/dom": "^10.4.0",
