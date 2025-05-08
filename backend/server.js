@@ -7,7 +7,6 @@ const fileRoutes = require('./routes/fileRoutes');
 const fileTreeRoutes = require('./routes/fileTreeRoutes');
 const videoRoutes = require('./routes/videoRoutes');
 const bodyParser = require('body-parser');
-const cors = require('cors');
 
 dotenv.config();
 const app = express();
