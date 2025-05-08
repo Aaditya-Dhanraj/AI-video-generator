@@ -18,7 +18,7 @@ const server = require('http').createServer(app);
 server.timeout = 300000;
 
 const corsOptions = {
-    origin: 'https://aadityadhanraj.com',
+    origin: ['https://ai-video-generator-taupe-nine.vercel.app'],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
     credentials: true, // Allow cookies to be sent with requests
